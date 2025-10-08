@@ -5,7 +5,7 @@ import os
 
 # توکن‌ها - اینجا رو پر کنید
 TELEGRAM_BOT_TOKEN = "8316442002:AAHkjQxfSzyla3ycKWXFGSV5M3piIXrJMk0"  # از @BotFather بگیرید
-HF_API_TOKEN = "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"  # توکن Hugging Face شما
+HF_API_TOKEN = "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"  # توکن Hugging Face شما
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
