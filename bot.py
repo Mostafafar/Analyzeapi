@@ -2,9 +2,13 @@ import telebot
 import requests
 import json
 import os
-import fitz  # PyMuPDF برای خواندن PDF
+import fitz  # PyMuPDF
 import re
 from collections import defaultdict
+import pytesseract
+from PIL import Image
+import io
+import tempfile
 
 # توکن‌ها
 TELEGRAM_BOT_TOKEN = "8316442002:AAHkjQxfSzyla3ycKWXFGSV5M3piIXrJMk0"
@@ -15,9 +19,41 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 # دیکشنری برای ذخیره سوالات کاربران
 user_questions = defaultdict(dict)
 
-def extract_questions_from_pdf(pdf_path):
-    """استخراج سوالات از فایل PDF با فرمت آزمون‌های ایرانی"""
+def extract_text_with_ocr(pdf_path):
+    """استخراج متن از PDF با استفاده از OCR"""
     try:
+        doc = fitz.open(pdf_path)
+        full_text = ""
+        
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            
+            # ابتدا سعی می‌کنیم متن مستقیم استخراج کنیم
+            text = page.get_text()
+            if text.strip():  # اگر متن مستقیم وجود داشت
+                full_text += text + "\n"
+            else:
+                # اگر متن مستقیم نبود، از OCR استفاده می‌کنیم
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # افزایش کیفیت
+                img_data = pix.tobytes("png")
+                image = Image.open(io.BytesIO(img_data))
+                
+                # استفاده از OCR برای فارسی
+                custom_config = r'--oem 3 --psm 6 -l fas+eng'
+                ocr_text = pytesseract.image_to_string(image, config=custom_config)
+                full_text += ocr_text + "\n"
+        
+        doc.close()
+        return full_text
+        
+    except Exception as e:
+        print(f"خطا در OCR: {e}")
+        return ""
+
+def extract_questions_from_pdf(pdf_path):
+    """استخراج سوالات از فایل PDF"""
+    try:
+        # ابتدا متن مستقیم استخراج می‌شود
         doc = fitz.open(pdf_path)
         full_text = ""
         
@@ -27,53 +63,67 @@ def extract_questions_from_pdf(pdf_path):
         
         doc.close()
         
-        print(f"متن استخراج شده: {full_text[:500]}...")  # برای دیباگ
+        print(f"متن مستقیم استخراج شده: {len(full_text)} کاراکتر")
         
-        # الگوهای مختلف برای سوالات آزمون‌های ایرانی
+        # اگر متن مستقیم کافی نبود، از OCR استفاده می‌کنیم
+        if len(full_text.strip()) < 100:
+            print("استفاده از OCR...")
+            full_text = extract_text_with_ocr(pdf_path)
+            print(f"متن OCR شده: {len(full_text)} کاراکتر")
+        
+        # نمایش نمونه متن برای دیباگ
+        sample = full_text[:500].replace('\n', ' ')
+        print(f"نمونه متن: {sample}")
+        
+        # الگوهای استخراج سوالات
         questions = {}
         
-        # الگوی اصلی: شماره سوال به صورت عدد و متن سوال
-        # مثال: "۱- در خصوص انواع یاخته‌ها..."
-        pattern1 = r'(\d+)[\-\.\)]\s*(.*?)(?=\d+[\-\.\)]|\Z)'
-        matches1 = re.findall(pattern1, full_text, re.DOTALL)
+        # الگوهای مختلف برای سوالات فارسی
+        patterns = [
+            r'(\d+)[\-\.\)]\s*(.*?)(?=\d+[\-\.\)]|$)',
+            r'سوال\s*(\d+)[\:\-]?\s*(.*?)(?=سوال\s*\d+|\d+[\-\.\)]|$)',
+            r'\(\s*(\d+)\s*\)\s*(.*?)(?=\(\s*\d+\s*\)|\d+[\-\.\)]|$)',
+            r'(\d+)\s*-\s*(.*?)(?=\d+\s*-|\d+[\-\.\)]|$)'
+        ]
         
-        # الگوی جایگزین: سوال‌هایی که با عدد و خط تیره شروع می‌شوند
-        pattern2 = r'(\d+)\-\s*(.*?)(?=\d+\-|\Z)'
-        matches2 = re.findall(pattern2, full_text, re.DOTALL)
+        for pattern in patterns:
+            matches = re.finditer(pattern, full_text, re.DOTALL)
+            for match in matches:
+                try:
+                    q_num = int(match.group(1))
+                    q_text = match.group(2).strip()
+                    
+                    # پاک‌سازی متن
+                    q_text = re.sub(r'[\n\r\t]+', ' ', q_text)
+                    q_text = re.sub(r'\s+', ' ', q_text)
+                    q_text = q_text.strip()
+                    
+                    # فیلترهای کیفیت
+                    if (len(q_text) > 30 and 
+                        not any(word in q_text.lower() for word in ['www.', 'http', '.com', '.ir']) and
+                        not q_text.replace(' ', '').replace('.', '').isdigit()):
+                        
+                        # محدود کردن طول متن
+                        if len(q_text) > 500:
+                            q_text = q_text[:500] + "..."
+                            
+                        questions[q_num] = q_text
+                        print(f"✅ سوال {q_num} یافت شد")
+                        
+                except (ValueError, IndexError) as e:
+                    continue
         
-        # الگوی برای سوالات داخل کادر یا فرمت خاص
-        pattern3 = r'سوال\s*(\d+)[\:\-]?\s*(.*?)(?=سوال\s*\d+|\d+[\-\.\)]|\Z)'
-        matches3 = re.findall(pattern3, full_text, re.DOTALL | re.IGNORECASE)
-        
-        # ترکیب همه matches
-        all_matches = matches1 + matches2 + matches3
-        
-        for match in all_matches:
-            try:
-                q_num = int(match[0])
-                q_text = match[1].strip()
-                
-                # پاک‌سازی متن سوال
-                q_text = re.sub(r'[\n\r]+', ' ', q_text)  # حذف خطوط جدید
-                q_text = re.sub(r'\s+', ' ', q_text)  # جایگزینی فاصله‌های متعدد
-                
-                # فیلتر کردن متن�های خیلی کوتاه
-                if len(q_text) > 20 and not q_text.startswith('www.') and not q_text.startswith('http'):
-                    questions[q_num] = q_text
-                    print(f"سوال {q_num} یافت شد: {q_text[:50]}...")
-            except ValueError:
-                continue
-        
-        # اگر هنوز سوالی پیدا نکردیم، از روش ساده‌تر استفاده می‌کنیم
+        # اگر هنوز سوالی پیدا نکردیم، روش ساده‌تر
         if not questions:
-            print("استفاده از روش ساده‌تر برای استخراج سوالات...")
+            print("استفاده از روش ساده‌تر...")
             lines = full_text.split('\n')
             current_q = None
             current_text = ""
             
-            for line in lines:
+            for i, line in enumerate(lines):
                 line = line.strip()
-                # تشخیص شروع سوال جدید
+                
+                # تشخیص سوال جدید
                 q_match = re.match(r'^(\d+)[\-\.\)]\s*(.*)', line)
                 if q_match:
                     if current_q is not None and current_text.strip():
@@ -81,20 +131,28 @@ def extract_questions_from_pdf(pdf_path):
                     
                     current_q = int(q_match.group(1))
                     current_text = q_match.group(2)
-                elif current_q is not None:
-                    # اگر خط جدید بخشی از سوال جاری است
-                    if line and not line.startswith('www.') and not line.startswith('http'):
+                elif current_q is not None and line:
+                    # ادامه سوال جاری
+                    if (not line.startswith('www.') and 
+                        not line.startswith('http') and
+                        len(line) > 5):
                         current_text += " " + line
+                
+                # اگر خط خالی است و متن زیادی جمع شده، سوال را ذخیره کن
+                elif current_q is not None and not line and len(current_text) > 50:
+                    questions[current_q] = current_text.strip()
+                    current_q = None
+                    current_text = ""
             
-            # اضافه کردن آخرین سوال
+            # آخرین سوال
             if current_q is not None and current_text.strip():
                 questions[current_q] = current_text.strip()
         
-        print(f"تعداد سوالات استخراج شده: {len(questions)}")
+        print(f"🎯 تعداد سوالات استخراج شده: {len(questions)}")
         return questions
         
     except Exception as e:
-        print(f"خطا در استخراج PDF: {e}")
+        print(f"❌ خطا در استخراج PDF: {e}")
         return {}
 
 def analyze_with_hf(text, context=""):
@@ -113,7 +171,7 @@ def analyze_with_hf(text, context=""):
     {context}
     
     متن:
-    {text[:1500]}
+    {text[:1000]}
     
     تحلیل به زبان فارسی:
     """
@@ -143,61 +201,58 @@ def analyze_with_hf(text, context=""):
     
     return "❌ پاسخ نامعتبر"
 
+# هندلرهای ربات (همانند قبل)
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = """
 🤖 **ربات تحلیل سوالات PDF**
 
-📚 **قابلیت‌ها:**
-• دریافت فایل‌های PDF حاوی سوالات
-• استخراج خودکار سوالات
-• نمایش سوالات خاص
-• تحلیل سوالات با هوش مصنوعی
+📚 **قابلیت‌های جدید:**
+• پشتیبانی از PDFهای اسکن شده (تصویری)
+• استخراج متن با OCR
+• نمایش و تحلیل سوالات
 
 📋 **دستورات:**
 /start - راهنمایی
-/list - نمایش لیست سوالات
+/list - نمایش لیست سوالات  
 /question [عدد] - نمایش سوال خاص
 /analyze [عدد] - تحلیل سوال با AI
-/clear - پاک کردن سوالات ذخیره شده
+/clear - پاک کردن سوالات
 
 📁 **فایل PDF خود را ارسال کنید**
+(حتی اگر اسکن تصویری باشد)
     """
     bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=['list'])
 def show_questions_list(message):
-    """نمایش لیست سوالات استخراج شده"""
     user_id = message.from_user.id
-    
     if user_id not in user_questions or not user_questions[user_id]:
-        bot.reply_to(message, "❌ هیچ سوالی ذخیره نشده است. ابتدا یک فایل PDF ارسال کنید.")
+        bot.reply_to(message, "❌ هیچ سوالی ذخیره نشده است.")
         return
     
     questions = user_questions[user_id]
     sorted_questions = sorted(questions.items())
     
     response = f"📋 **لیست سوالات** ({len(questions)} سوال)\n\n"
-    
-    for q_num, q_text in sorted_questions:
-        preview = q_text[:80] + "..." if len(q_text) > 80 else q_text
+    for q_num, q_text in sorted_questions[:10]:  # فقط 10 سوال اول
+        preview = q_text[:60] + "..." if len(q_text) > 60 else q_text
         response += f"**سوال {q_num}:** {preview}\n\n"
     
-    response += "➡️ برای نمایش کامل یک سوال: /question [عدد]"
+    if len(questions) > 10:
+        response += f"📖 ... و {len(questions) - 10} سوال دیگر\n"
     
+    response += "➡️ برای نمایش کامل: /question [عدد]"
     bot.reply_to(message, response)
 
 @bot.message_handler(commands=['question'])
 def show_specific_question(message):
-    """نمایش سوال خاص"""
     user_id = message.from_user.id
-    
     if user_id not in user_questions or not user_questions[user_id]:
         bot.reply_to(message, "❌ هیچ سوالی ذخیره نشده است.")
         return
     
     try:
-        # استخراج شماره سوال از پیام
         command_parts = message.text.split()
         if len(command_parts) < 2:
             bot.reply_to(message, "❌ لطفاً شماره سوال را وارد کنید:\n/question 5")
@@ -208,30 +263,17 @@ def show_specific_question(message):
         
         if q_number in questions:
             response = f"**سوال {q_number}:**\n\n{questions[q_number]}"
-            
-            # اضافه کردن دکمه‌های سریع
-            markup = telebot.types.InlineKeyboardMarkup()
-            analyze_btn = telebot.types.InlineKeyboardButton(
-                f"تحلیل سوال {q_number}", 
-                callback_data=f"analyze_{q_number}"
-            )
-            markup.add(analyze_btn)
-            
-            bot.reply_to(message, response, reply_markup=markup)
+            bot.reply_to(message, response)
         else:
             available = list(questions.keys())
-            bot.reply_to(message, f"❌ سوال {q_number} یافت نشد. سوالات موجود: {min(available)} تا {max(available)}")
+            bot.reply_to(message, f"❌ سوال {q_number} یافت نشد. سوالات موجود: {min(available)}-{max(available)}")
             
     except ValueError:
-        bot.reply_to(message, "❌ شماره سوال باید یک عدد باشد.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ خطا: {str(e)}")
+        bot.reply_to(message, "❌ شماره سوال باید عدد باشد.")
 
 @bot.message_handler(commands=['analyze'])
 def analyze_question(message):
-    """تحلیل سوال با هوش مصنوعی"""
     user_id = message.from_user.id
-    
     if user_id not in user_questions or not user_questions[user_id]:
         bot.reply_to(message, "❌ هیچ سوالی ذخیره نشده است.")
         return
@@ -246,64 +288,32 @@ def analyze_question(message):
         questions = user_questions[user_id]
         
         if q_number in questions:
-            bot.send_message(message.chat.id, f"🔍 در حال تحلیل سوال {q_number}...")
-            
-            analysis = analyze_with_hf(
-                questions[q_number], 
-                "این یک سوال زیست شناسی است. لطفاً آن را تحلیل کرده و نکات کلیدی را استخراج کن:"
-            )
-            
+            bot.send_message(message.chat.id, f"🔍 تحلیل سوال {q_number}...")
+            analysis = analyze_with_hf(questions[q_number], "این سوال زیست شناسی است. تحلیل کن:")
             response = f"**تحلیل سوال {q_number}:**\n\n{analysis}"
             bot.reply_to(message, response)
         else:
             bot.reply_to(message, f"❌ سوال {q_number} یافت نشد.")
             
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در تحلیل: {str(e)}")
+        bot.reply_to(message, f"❌ خطا: {str(e)}")
 
 @bot.message_handler(commands=['clear'])
 def clear_questions(message):
-    """پاک کردن سوالات ذخیره شده"""
     user_id = message.from_user.id
     user_questions[user_id] = {}
-    bot.reply_to(message, "✅ سوالات ذخیره شده پاک شدند.")
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    """مدیریت کلیک روی دکمه‌های اینلاین"""
-    user_id = call.from_user.id
-    
-    if call.data.startswith('analyze_'):
-        try:
-            q_number = int(call.data.split('_')[1])
-            
-            if user_id in user_questions and q_number in user_questions[user_id]:
-                bot.answer_callback_query(call.id, "در حال تحلیل...")
-                
-                analysis = analyze_with_hf(
-                    user_questions[user_id][q_number],
-                    "این یک سوال زیست شناسی است. لطفاً آن را تحلیل کن:"
-                )
-                
-                response = f"**تحلیل سوال {q_number}:**\n\n{analysis}"
-                bot.send_message(call.message.chat.id, response)
-            else:
-                bot.answer_callback_query(call.id, "سوال یافت نشد!")
-                
-        except Exception as e:
-            bot.answer_callback_query(call.id, "خطا در تحلیل!")
+    bot.reply_to(message, "✅ سوالات پاک شدند.")
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
-    """مدیریت دریافت فایل PDF"""
     try:
         user_id = message.from_user.id
         
         if not message.document.file_name.lower().endswith('.pdf'):
-            bot.reply_to(message, "❌ لطفاً فقط فایل PDF ارسال کنید.")
+            bot.reply_to(message, "❌ فقط فایل PDF ارسال کنید.")
             return
         
-        bot.send_message(message.chat.id, "📥 فایل PDF دریافت شد. در حال استخراج سوالات...")
+        bot.send_message(message.chat.id, "📥 دریافت فایل...")
         
         # دریافت فایل
         file_info = bot.get_file(message.document.file_id)
@@ -315,20 +325,21 @@ def handle_document(message):
             f.write(downloaded_file)
         
         # استخراج سوالات
+        bot.send_message(message.chat.id, "🔍 در حال استخراج سوالات...")
         questions = extract_questions_from_pdf(filename)
         
         # حذف فایل موقت
         os.remove(filename)
         
         if not questions:
-            bot.reply_to(message, """❌ هیچ سوالی در فایل پیدا نشد.
+            bot.reply_to(message, """❌ سوالی استخراج نشد.
 
-📝 **راهنمایی:**
-- مطمئن شوید فایل PDF قابل انتخاب باشد (اسکن تصویری نباشد)
-- سوالات باید با فرمت استاندارد باشند (مثلاً: '۱- متن سوال...')
-- فایل ممکن است قفل باشد یا محافظت شده باشد
+🔧 **راه‌حل‌ها:**
+1. مطمئن شوید فایل قفل نباشد
+2. سوالات با شماره واضح باشند (مثلاً: ۱- متن سوال)
+3. فایل متن قابل انتخاب داشته باشد
 
-🔄 لطفاً فایل PDF دیگری ارسال کنید.""")
+📤 فایل دیگری ارسال کنید""")
             return
         
         # ذخیره سوالات
@@ -336,59 +347,49 @@ def handle_document(message):
         
         # نمایش نتایج
         response = f"✅ **استخراج موفق**\n\n"
-        response += f"📊 تعداد سوالات یافت شده: {len(questions)}\n"
-        response += f"🔢 محدوده سوالات: {min(questions.keys())} تا {max(questions.keys())}\n\n"
-        response += "**دستورات قابل استفاده:**\n"
-        response += "/list - نمایش لیست سوالات\n"
-        response += "/question [عدد] - نمایش سوال خاص\n"
-        response += "/analyze [عدد] - تحلیل سوال\n"
-        response += "یا عدد سوال را مستقیم تایپ کنید (مثلاً: 5)"
+        response += f"📊 تعداد سوالات: {len(questions)}\n"
+        response += f"🔢 محدوده: {min(questions.keys())}-{max(questions.keys())}\n\n"
+        response += "**دستورات:**\n"
+        response += "/list - نمایش لیست\n"
+        response += "/question 5 - نمایش سوال 5\n"
+        response += "/analyze 5 - تحلیل سوال 5\n"
+        response += "یا عدد سوال را تایپ کنید"
         
         bot.reply_to(message, response)
         
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در پردازش فایل: {str(e)}")
+        bot.reply_to(message, f"❌ خطا: {str(e)}")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    """مدیریت پیام‌های متنی"""
     if message.text.startswith('/'):
         return
     
-    # اگر کاربر عدد وارد کرد، سوال مربوطه را نشان بده
     try:
         q_number = int(message.text.strip())
         user_id = message.from_user.id
         
         if user_id in user_questions and q_number in user_questions[user_id]:
-            # ایجاد پیام دستوری برای نمایش سوال
             fake_message = type('obj', (object,), {
                 'from_user': message.from_user,
                 'chat': message.chat,
                 'text': f'/question {q_number}'
             })
             show_specific_question(fake_message)
-            return
         else:
-            bot.reply_to(message, f"❌ سوال {q_number} یافت نشد. از /list برای دیدن سوالات موجود استفاده کنید.")
+            bot.reply_to(message, f"❌ سوال {q_number} یافت نشد. از /list استفاده کنید.")
             
     except ValueError:
-        # اگر عدد نبود، راهنمایی نمایش بده
         bot.reply_to(message, """
-📚 برای استفاده:
-1. فایل PDF سوالات را ارسال کنید
-2. از دستورات استفاده کنید:
+📚 راهنمایی:
+1. PDF ارسال کنید
+2. از دستورات استفاده کنید
 
-/list - نمایش لیست سوالات  
-/question 5 - نمایش سوال 5
-/analyze 5 - تحلیل سوال 5
-/clear - پاک کردن سوالات
-
-یا عدد سوال را مستقیم تایپ کنید (مثلاً: 5)
+/list - لیست سوالات
+/question 5 - نمایش سوال  
+/analyze 5 - تحلیل سوال
         """)
 
-# اجرای ربات
 if __name__ == "__main__":
-    print("🤖 ربات سوالات PDF فعال شد...")
-    print("📚 آماده دریافت فایل‌های PDF...")
+    print("🤖 ربات فعال شد...")
     bot.polling()
